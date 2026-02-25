@@ -160,7 +160,7 @@ Hold the **BOOT button for 3 seconds** at any time while the device is running. 
 └─────────────────────────────────────────────────┘
 ```
 
-- **Bid total** — only counts auctions with confirmed bids (starting prices not included)
+- **Bid total** — SUPPOSED TO only count auctions with confirmed bids. But was unable to pull that off.
 - **Snipe mode** — triggers automatically when any auction enters last hour (see above)
 
 ---
@@ -244,5 +244,5 @@ This firmware **does not persist any eBay data**. Auction titles, prices, and en
 - The bid total in the header counts only listings where someone has **actually placed a bid** — starting price listings with zero bids are not included.
 - Up to **60 total listings** stored. With multiple keywords per seller each fetching up to 50 items, coverage is broad but there is a cap.
 - Seller IDs are case-insensitive on eBay's end.
-- eBay developer account approval can take up to 24 hours — plan ahead before your next auction batch.
+- eBay developer account approval can take up to 24 hours 
 
