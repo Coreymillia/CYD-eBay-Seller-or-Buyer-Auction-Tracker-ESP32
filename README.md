@@ -8,6 +8,8 @@ Originally built for personal use to keep an eye on active coin and hobo nickel 
 
 ![CYDEbayTicker in action](IMG_20260224_165222.jpg)
 
+![CYDEbayTicker with scrolling titles and touch](IMG_20260304_143927.jpg)
+
 ---
 
 ## What It Shows
@@ -26,14 +28,15 @@ Heavily Altered Bald Bust рG...     $9.50   2d 1h
 
 | Column | Description |
 |--------|-------------|
-| **Title** | Truncated auction title (30 chars) |
+| **Title** | Scrolling auction title — each row a different color, long titles scroll one at a time in order |
 | **Price** | Current bid amount |
 | **Time left** | 🟢 Green — more than 1 hour · 🟠 Orange — under 1 hour · 🔴 Red — ENDED |
 
 **Header line 1:** Your seller name(s) + page indicator  
 **Header line 2:** Auction count (cyan) · last updated time (grey) · total confirmed bids (gold)
 
-**Short-press BOOT** — next page  
+**Tap left half of screen** — previous page  
+**Tap right half of screen** — next page  
 **Hold BOOT 3 seconds** — re-enter setup
 
 ### Automatic Snipe Mode
@@ -51,6 +54,7 @@ It switches back to normal pace once all auctions are back above 1 hour or ended
 - **Board:** ESP32 CYD (ESP32-2432S028R or compatible — the "Cheap Yellow Display")
 - **Display:** ILI9341 TFT 320×240 landscape
   - DC = GPIO 2, CS = GPIO 15, SCK = GPIO 14, MOSI = GPIO 13, MISO = GPIO 12
+- **Touch:** XPT2046 resistive touchscreen controller (VSPI — CLK = GPIO 25, MISO = GPIO 39, MOSI = GPIO 32, CS = GPIO 33, IRQ = GPIO 36)
 - **Backlight:** GPIO 21 (active HIGH)
 - **BOOT button:** GPIO 0 (active LOW, INPUT_PULLUP)
 
@@ -160,8 +164,10 @@ Hold the **BOOT button for 3 seconds** at any time while the device is running. 
 └─────────────────────────────────────────────────┘
 ```
 
-- **Bid total** — SUPPOSED TO only count auctions with confirmed bids. But was unable to pull that off.
+- **Bid total** — only counts auctions with confirmed bids (starting prices not included)
 - **Snipe mode** — triggers automatically when any auction enters last hour (see above)
+- **Title colors** — each of the 10 rows uses a distinct color (white, cyan, yellow, magenta, green, orange, sky blue, peach, light cyan, amber) making rows easy to track at a glance
+- **Scrolling titles** — long titles that don't fit the column scroll one row at a time in order; when a row finishes scrolling it pauses, resets, and the next long title takes its turn
 
 ---
 
@@ -172,6 +178,7 @@ Hold the **BOOT button for 3 seconds** at any time while the device is running. 
 ```
 moononournation/GFX Library for Arduino @ 1.4.7
 bblanchon/ArduinoJson @ ^7
+https://github.com/PaulStoffregen/XPT2046_Touchscreen.git
 ```
 
 Built-in to ESP32 Arduino core: `WiFiClientSecure`, `HTTPClient`, `WebServer`, `DNSServer`, `Preferences`
@@ -200,9 +207,46 @@ CYDEbayTicker/
 ├── platformio.ini       # Board: esp32dev, framework: arduino, libs
 ├── include/
 │   ├── Portal.h         # Captive portal web UI, NVS load/save, all credential globals
-│   └── eBay.h           # OAuth token fetch, Browse API calls, item parse/dedup/sort
+│   ├── eBay.h           # OAuth token fetch, Browse API calls, item parse/dedup/sort
+│   └── CYDIdentity.h    # ESP32 self-identification HTTP server (GET /identify)
 └── src/
-    └── main.cpp         # Display init, NTP sync, header/listing draw, paging, refresh loop
+    └── main.cpp         # Display init, NTP sync, header/listing draw, touch, scrolling, refresh loop
+```
+
+---
+
+## CYDIdentity Patch
+
+This firmware includes the **CYDIdentity patch** — a lightweight HTTP server running on port 80 that responds to `GET /identify` with a JSON description of the device:
+
+```json
+{
+  "name":       "CYDEbayTicker",
+  "mac":        "AA:BB:CC:DD:EE:FF",
+  "version":    "1.0.0",
+  "uptime_s":   3742,
+  "rssi":       -58,
+  "last_fetch": 1709584800,
+  "errors":     0
+}
+```
+
+This is designed to work with **CYDPiAlert** — a companion firmware for a second CYD board connected to a [Pi.Alert](https://github.com/pucherot/Pi.Alert) Raspberry Pi network scanner. CYDPiAlert's "ESP Devices" mode scans your local network, probes each device's `/identify` endpoint, and displays the name, IP, uptime, and signal strength of every patched ESP32 on your network — and can automatically rename unknown devices in Pi.Alert by their firmware name.
+
+### What the patch adds
+
+- Serves `GET /identify` on port 80 (shares the port with the setup portal; portal closes before identity server starts)
+- Requires `CYDIdentity.h` in the `include/` folder
+- Calls `identityBegin()` in `setup()` after WiFi connects and portal closes
+- Calls `identityHandle()` at the top of `loop()` to service incoming requests
+- Adds no noticeable overhead — the identity server only wakes when a request arrives
+
+### Using without CYDPiAlert
+
+The identity endpoint is harmless if you don't have CYDPiAlert — it just sits there silently and answers if anything asks. You can query it manually:
+
+```bash
+curl http://<device-ip>/identify
 ```
 
 ---
@@ -244,5 +288,5 @@ This firmware **does not persist any eBay data**. Auction titles, prices, and en
 - The bid total in the header counts only listings where someone has **actually placed a bid** — starting price listings with zero bids are not included.
 - Up to **60 total listings** stored. With multiple keywords per seller each fetching up to 50 items, coverage is broad but there is a cap.
 - Seller IDs are case-insensitive on eBay's end.
-- eBay developer account approval can take up to 24 hours 
+- eBay developer account approval can take up to 24 hours — plan ahead before your next auction batch.
 
