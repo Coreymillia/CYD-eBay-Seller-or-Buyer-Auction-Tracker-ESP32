@@ -23,6 +23,7 @@ static char eb_cat_id[16]     = "";  // eBay category ID (alternative to keyword
 static char eb_keyword[64]    = "";  // fallback keyword search (used if no sellers set)
 static bool eb_has_settings   = false;
 static bool eb_force_portal   = false;
+static uint8_t eb_brightness  = 200;   // backlight 10–255
 
 // ---------------------------------------------------------------------------
 // Portal state
@@ -74,12 +75,15 @@ static void ebLoadSettings() {
   eb_has_settings = (ssid[0] != '\0' && appid[0] != '\0' && certid[0] != '\0'
                      && (hasKeyword || (hasSeller && hasSellerSearch)));
   eb_force_portal = force;
+  eb_brightness   = (uint8_t)prefs.getUChar("bright", 200);
+  if (eb_brightness < 10) eb_brightness = 10;
 }
 
 static void ebSaveSettings(const char *ssid, const char *pass,
                             const char *appid,  const char *certid,
                             const char *seller1, const char *seller2, const char *seller3,
-                            const char *seller_kw, const char *cat_id, const char *keyword) {
+                            const char *seller_kw, const char *cat_id, const char *keyword,
+                            uint8_t brightness) {
   Preferences prefs;
   prefs.begin("cydebay", false);
   prefs.putString("ssid",      ssid);
@@ -92,6 +96,7 @@ static void ebSaveSettings(const char *ssid, const char *pass,
   prefs.putString("seller_kw", seller_kw);
   prefs.putString("cat_id",    cat_id);
   prefs.putString("keyword",   keyword);
+  prefs.putUChar("bright",     brightness);
   prefs.end();
 
   strncpy(eb_wifi_ssid,  ssid,      sizeof(eb_wifi_ssid)  - 1);
@@ -104,6 +109,7 @@ static void ebSaveSettings(const char *ssid, const char *pass,
   strncpy(eb_seller_kw,  seller_kw, sizeof(eb_seller_kw)  - 1);
   strncpy(eb_cat_id,     cat_id,    sizeof(eb_cat_id)     - 1);
   strncpy(eb_keyword,    keyword,   sizeof(eb_keyword)    - 1);
+  eb_brightness   = brightness;
   eb_has_settings = true;
 }
 
@@ -181,6 +187,9 @@ static void ebHandleRoot() {
     ".btn-skip:hover{background:#222211;color:#aa9900;}"
     ".note{color:#443300;font-size:0.82em;margin-top:16px;}"
     "hr{border:1px solid #332200;margin:20px 0;}"
+    ".rng{display:flex;align-items:center;gap:8px;margin:6px 0 14px;}"
+    ".rng input[type=range]{flex:1;accent-color:#ffdd00;}"
+    ".rng output{min-width:28px;text-align:right;color:#ffcc00;}"
     ".sect{color:#aa7700;font-size:0.85em;text-align:left;margin:18px 0 6px;"
           "border-bottom:1px solid #332200;padding-bottom:4px;}"
     "</style></head><body>"
@@ -238,6 +247,12 @@ static void ebHandleRoot() {
     "<input type='text' name='keyword' value='";
   html += String(eb_keyword);
   html += "' placeholder='e.g. vintage rolex' maxlength='63'>"
+    "<label>Brightness:</label>"
+    "<div class='rng'><input type='range' name='bright' min='10' max='255' value='";
+  html += String(eb_brightness);
+  html += "' oninput='this.nextElementSibling.value=this.value'><output>";
+  html += String(eb_brightness);
+  html += "</output></div>"
     "<br><button class='btn btn-save' type='submit'>&#128190; Save &amp; Connect</button>"
     "</form>";
   if (eb_has_settings) {
@@ -288,7 +303,8 @@ static void ebHandleSave() {
 
   ebSaveSettings(ssid.c_str(), pass.c_str(), appid.c_str(), certid.c_str(),
                  seller1.c_str(), seller2.c_str(), seller3.c_str(),
-                 seller_kw.c_str(), cat_id.c_str(), keyword.c_str());
+                 seller_kw.c_str(), cat_id.c_str(), keyword.c_str(),
+                 portalServer->hasArg("bright") ? (uint8_t)constrain(portalServer->arg("bright").toInt(), 10, 255) : 200);
 
   String sellers = "";
   if (seller1.length()) sellers += "<b>" + seller1 + "</b> ";

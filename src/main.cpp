@@ -441,7 +441,9 @@ void setup() {
   gfx->fillScreen(RGB565_BLACK);
 
   pinMode(GFX_BL, OUTPUT);
-  digitalWrite(GFX_BL, HIGH);
+  ledcSetup(0, 5000, 8);
+  ledcAttachPin(GFX_BL, 0);
+  ledcWrite(0, 255);
 
   pinMode(0, INPUT_PULLUP);
 
@@ -451,6 +453,7 @@ void setup() {
   ts.setRotation(1);
 
   ebLoadSettings();
+  ledcWrite(0, eb_brightness);
 
   bool showPortal = !eb_has_settings || eb_force_portal;
 
@@ -469,6 +472,7 @@ void setup() {
       delay(5);
     }
     ebClosePortal();
+    ledcWrite(0, eb_brightness);
   }
 
   // Connect WiFi
