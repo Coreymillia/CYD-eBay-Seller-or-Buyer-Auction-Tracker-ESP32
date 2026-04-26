@@ -4,7 +4,7 @@
 // Updates every 5 minutes. Short press BOOT cycles pages; 3s hold = setup.
 
 #define DEVICE_NAME      "CYDEbayTicker"
-#define FIRMWARE_VERSION "1.0.0"
+#define FIRMWARE_VERSION "1.0.1"
 #include "CYDIdentity.h"
 
 #include <Arduino.h>

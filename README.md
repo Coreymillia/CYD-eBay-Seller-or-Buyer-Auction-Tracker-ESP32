@@ -233,6 +233,12 @@ This firmware includes the **CYDIdentity patch** — a lightweight HTTP server r
 
 This is designed to work with **CYDPiAlert** — a companion firmware for a second CYD board connected to a [Pi.Alert](https://github.com/pucherot/Pi.Alert) Raspberry Pi network scanner. CYDPiAlert's "ESP Devices" mode scans your local network, probes each device's `/identify` endpoint, and displays the name, IP, uptime, and signal strength of every patched ESP32 on your network — and can automatically rename unknown devices in Pi.Alert by their firmware name.
 
+`errors` is a bitmask:
+
+- `0` = no current fetch errors
+- `1` = OAuth/token fetch failure
+- `2` = Browse API fetch failure
+
 ### What the patch adds
 
 - Serves `GET /identify` on port 80 (shares the port with the setup portal; portal closes before identity server starts)
@@ -255,8 +261,8 @@ curl http://<device-ip>/identify
 
 1. **Captive portal setup** — on first boot the ESP32 runs a WiFi access point with a web server. You configure everything through a browser. Settings are written to NVS flash.
 2. **WiFi + NTP** — connects to your network, then syncs UTC time from `pool.ntp.org`. UTC time is required to calculate accurate countdowns from eBay's ISO 8601 end timestamps.
-3. **OAuth token** — fetches a 2-hour Bearer token from `api.ebay.com/identity/v1/oauth2/token` using your App ID + Cert ID (Client Credentials grant). Token is cached in RAM and auto-refreshed.
-4. **Browse API fetch** — for each seller + keyword combination, calls `api.ebay.com/buy/browse/v1/item_summary/search` with `filter=sellers:{id},buyingOptions:{AUCTION}`. Results are deduplicated by eBay item ID across calls.
+3. **OAuth token** — fetches a 2-hour Bearer token from `api.ebay.com/identity/v1/oauth2/token` using your App ID + Cert ID (Client Credentials grant). Token is cached in RAM and auto-refreshed. If `api.ebay.com` DNS resolution fails on the ESP32, the firmware can bootstrap the official host by known public IPs while still using `api.ebay.com` as the TLS/HTTP host.
+4. **Browse API fetch** — for each seller + keyword combination, calls `api.ebay.com/buy/browse/v1/item_summary/search` with `filter=sellers:{id},buyingOptions:{AUCTION}`. Results are deduplicated by eBay item ID across calls. Browse requests use the same official-host bootstrap path as OAuth.
 5. **Merge & sort** — all items combined and sorted by `endEpoch` ascending (soonest ending = row 1).
 6. **Live countdown** — time-left column redraws on a tick interval (10s in snipe mode, 30s normal) without re-fetching.
 7. **Full refresh** — re-fetches all data every 60s (snipe mode) or 5 minutes (normal).
@@ -271,6 +277,8 @@ This firmware **does not persist any eBay data**. Auction titles, prices, and en
 
 | Error on screen | Cause | Fix |
 |----------------|-------|-----|
+| `Fetch failed: OAuth connection refused (-1)` | Token refresh could not open HTTPS connection | Check WiFi/router connectivity and DNS; transient network/TLS issues retry automatically |
+| `Fetch failed: OAuth DNS failed` | DNS could not resolve the official eBay API host | Firmware retries with fallback DNS servers, then bootstraps `api.ebay.com` by known public IPs while keeping the official TLS/HTTP host name |
 | `Fetch failed: HTTP 401` | OAuth token invalid or truncated | Re-enter Cert ID in setup; check for copy/paste errors |
 | `Fetch failed: HTTP 400` | Keyword or category issue | Check your keyword field — try simpler single words |
 | `Fetch failed: HTTP 403` | Wrong keys or Sandbox keys used | Use **Production** keys, not Sandbox |
@@ -279,6 +287,22 @@ This firmware **does not persist any eBay data**. Auction titles, prices, and en
 | `WiFi failed: "YourSSID"` | Wrong SSID/password or 5 GHz network | Hold BOOT 3s; ESP32 requires 2.4 GHz |
 | Times wrong / `ENDED` for active items | NTP failed | Check router DNS; will retry on next boot |
 | Only partial auctions found | Keyword doesn't match all listing titles | Add more comma-separated keywords covering all your listing title words |
+
+### April 2026 connectivity fix
+
+Some ESP32 networks started failing to resolve `api.ebay.com` even though the rest of the device was online. That looked like `OAuth -1` at first, but the real break was:
+
+1. DNS resolution for the official eBay API host became unreliable on the ESP32.
+2. After bypassing DNS, the firmware still had to handle real HTTP response bodies correctly (`Content-Length` and `Transfer-Encoding: chunked`) or valid JSON would be misread as a parse error.
+
+The current firmware now:
+
+- keeps using the **official** eBay OAuth and Browse host: `api.ebay.com`
+- retries transient HTTPS failures once
+- retries DNS using fallback resolvers
+- bootstraps the official host by known public IPs when hostname lookup still fails
+- parses both fixed-length and chunked JSON responses correctly
+- exposes better live failure state through `/identify`
 
 ---
 
@@ -289,4 +313,3 @@ This firmware **does not persist any eBay data**. Auction titles, prices, and en
 - Up to **60 total listings** stored. With multiple keywords per seller each fetching up to 50 items, coverage is broad but there is a cap.
 - Seller IDs are case-insensitive on eBay's end.
 - eBay developer account approval can take up to 24 hours — plan ahead before your next auction batch.
-

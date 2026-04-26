@@ -5,6 +5,7 @@
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <time.h>
+#include "CYDIdentity.h"
 
 #define EB_MAX_ITEMS   60   // max total items stored
 #define EB_PER_PAGE    10   // items displayed per screen page
@@ -29,12 +30,389 @@ static EbayItem eb_items[EB_MAX_ITEMS];
 static int      eb_item_count  = 0;
 static char     eb_last_error[64] = "";
 static time_t   eb_last_fetch  = 0;
+static IPAddress eb_last_api_ip;
+static char     eb_api_host[20] = "api.ebay.com";
 
 // OAuth token cache (Browse API requires Bearer token)
 // eBay tokens can exceed 1000 chars; use generous buffers to avoid truncation
 static char   eb_token[2048]    = "";
 static char   eb_auth_hdr[2100] = "";   // "Bearer <token>"
 static time_t eb_token_expiry   = 0;
+
+static void b64Encode(const char *src, char *dst, size_t dstLen);
+
+#define EB_ERRFLAG_OAUTH  0x00000001u
+#define EB_ERRFLAG_BROWSE 0x00000002u
+
+// ---------------------------------------------------------------------------
+// Error helpers
+// ---------------------------------------------------------------------------
+static bool ebShouldRetryHttpCode(int code) {
+  return (code < 0 || code >= 500);
+}
+
+static const char *ebFallbackApiHost(const char *host) {
+  return (strcmp(host, "api.ebay.com") == 0) ? "apiz.ebay.com" : nullptr;
+}
+
+static void ebSetHttpError(const char *prefix, int code) {
+  String detail = (code < 0) ? HTTPClient::errorToString(code) : String();
+  if (detail.length() > 0) {
+    snprintf(eb_last_error, sizeof(eb_last_error), "%s %s (%d)",
+             prefix, detail.c_str(), code);
+  } else {
+    snprintf(eb_last_error, sizeof(eb_last_error), "%s HTTP %d", prefix, code);
+  }
+}
+
+static void ebLogNetContext(const char *prefix) {
+  Serial.printf("[eBay] %s net: ip=%s gw=%s dns1=%s dns2=%s rssi=%d\n",
+                prefix,
+                WiFi.localIP().toString().c_str(),
+                WiFi.gatewayIP().toString().c_str(),
+                WiFi.dnsIP(0).toString().c_str(),
+                WiFi.dnsIP(1).toString().c_str(),
+                WiFi.RSSI());
+}
+
+static bool ebApplyFallbackDns(const char *prefix) {
+  IPAddress local = WiFi.localIP();
+  IPAddress gw    = WiFi.gatewayIP();
+  IPAddress mask  = WiFi.subnetMask();
+  IPAddress dns1(1, 1, 1, 1);
+  IPAddress dns2(8, 8, 8, 8);
+
+  if ((uint32_t)local == 0 || (uint32_t)gw == 0 || (uint32_t)mask == 0) {
+    Serial.printf("[eBay] %s cannot apply fallback DNS: incomplete network config\n", prefix);
+    ebLogNetContext(prefix);
+    return false;
+  }
+
+  if (WiFi.dnsIP(0) == dns1 && WiFi.dnsIP(1) == dns2) {
+    return true;
+  }
+
+  bool ok = WiFi.config(local, gw, mask, dns1, dns2);
+  Serial.printf("[eBay] %s fallback DNS %s -> dns1=%s dns2=%s\n",
+                prefix,
+                ok ? "applied" : "failed",
+                dns1.toString().c_str(),
+                dns2.toString().c_str());
+  delay(250);
+  ebLogNetContext(prefix);
+  return ok;
+}
+
+static bool ebResolveApiHost(IPAddress &apiIp) {
+  const char *hosts[] = {"api.ebay.com", "apiz.ebay.com"};
+  for (size_t i = 0; i < 2; i++) {
+    if (WiFi.hostByName(hosts[i], apiIp)) {
+      strncpy(eb_api_host, hosts[i], sizeof(eb_api_host) - 1);
+      eb_api_host[sizeof(eb_api_host) - 1] = '\0';
+      return true;
+    }
+  }
+  return false;
+}
+
+static bool ebConnectOfficialApiHost(WiFiClientSecure &client, IPAddress &usedIp) {
+  if (WiFi.hostByName("api.ebay.com", usedIp)) {
+    if (client.connect(usedIp, 443, "api.ebay.com", nullptr, nullptr, nullptr)) {
+      return true;
+    }
+  }
+
+  const IPAddress bootstrapIps[] = {
+    IPAddress(151, 101, 2, 206),
+    IPAddress(151, 101, 66, 206),
+    IPAddress(151, 101, 130, 206),
+    IPAddress(151, 101, 194, 206),
+  };
+
+  for (const IPAddress &ip : bootstrapIps) {
+    if (client.connect(ip, 443, "api.ebay.com", nullptr, nullptr, nullptr)) {
+      usedIp = ip;
+      return true;
+    }
+  }
+
+  return false;
+}
+
+static bool ebReadHttpResponse(WiFiClientSecure &client, int &statusCode, String &body) {
+  String statusLine = client.readStringUntil('\n');
+  statusLine.trim();
+  if (!statusLine.startsWith("HTTP/1.")) {
+    return false;
+  }
+
+  int sp1 = statusLine.indexOf(' ');
+  int sp2 = statusLine.indexOf(' ', sp1 + 1);
+  statusCode = (sp1 >= 0) ? statusLine.substring(sp1 + 1, sp2 > sp1 ? sp2 : statusLine.length()).toInt() : 0;
+
+  int contentLength = -1;
+  bool chunked = false;
+  while (client.connected() || client.available()) {
+    String line = client.readStringUntil('\n');
+    String trimmed = line;
+    trimmed.trim();
+    if (trimmed.length() == 0) break;
+
+    String headerLower = trimmed;
+    headerLower.toLowerCase();
+
+    if (headerLower.startsWith("content-length:")) {
+      contentLength = trimmed.substring(trimmed.indexOf(':') + 1).toInt();
+    } else if (headerLower.startsWith("transfer-encoding:")) {
+      chunked = (headerLower.indexOf("chunked") >= 0);
+    }
+  }
+
+  body = "";
+  if (chunked) {
+    while (true) {
+      String sizeLine = client.readStringUntil('\n');
+      sizeLine.trim();
+      if (sizeLine.length() == 0) continue;
+
+      int semi = sizeLine.indexOf(';');
+      if (semi >= 0) sizeLine = sizeLine.substring(0, semi);
+      long chunkSize = strtol(sizeLine.c_str(), nullptr, 16);
+      if (chunkSize < 0) return false;
+      if (chunkSize == 0) {
+        while (client.connected() || client.available()) {
+          String trailer = client.readStringUntil('\n');
+          trailer.trim();
+          if (trailer.length() == 0) break;
+        }
+        break;
+      }
+
+      unsigned long lastDataMs = millis();
+      while (chunkSize > 0) {
+        if (!client.available()) {
+          if (millis() - lastDataMs >= 15000) return false;
+          delay(10);
+          continue;
+        }
+        char c = (char)client.read();
+        body += c;
+        chunkSize--;
+        lastDataMs = millis();
+      }
+
+      // Consume CRLF after each chunk.
+      unsigned long crlfStart = millis();
+      while (client.available() < 2) {
+        if (millis() - crlfStart >= 15000) return false;
+        delay(10);
+      }
+      client.read();
+      client.read();
+    }
+  } else if (contentLength >= 0) {
+    unsigned long lastDataMs = millis();
+    while ((int)body.length() < contentLength) {
+      if (!client.available()) {
+        if (millis() - lastDataMs >= 15000) return false;
+        delay(10);
+        continue;
+      }
+      char c = (char)client.read();
+      body += c;
+      lastDataMs = millis();
+    }
+  } else {
+    unsigned long lastDataMs = millis();
+    while ((client.connected() || client.available()) && millis() - lastDataMs < 15000) {
+      while (client.available()) {
+        body += (char)client.read();
+        lastDataMs = millis();
+      }
+      delay(10);
+    }
+  }
+  return true;
+}
+
+static bool ebExtractUri(const char *url, char *uri, size_t uriLen) {
+  const char *scheme = strstr(url, "://");
+  const char *path = scheme ? strchr(scheme + 3, '/') : strchr(url, '/');
+  if (!path) return false;
+  strncpy(uri, path, uriLen - 1);
+  uri[uriLen - 1] = '\0';
+  return true;
+}
+
+static bool ebFetchTokenOfficial(String &body, int &statusCode) {
+  WiFiClientSecure client;
+  client.setInsecure();
+  client.setTimeout(8);
+  client.setHandshakeTimeout(8);
+
+  IPAddress usedIp;
+  if (!ebConnectOfficialApiHost(client, usedIp)) {
+    char sslErr[96] = "";
+    int sslCode = client.lastError(sslErr, sizeof(sslErr));
+    if (sslCode != 0) {
+      snprintf(eb_last_error, sizeof(eb_last_error), "OAuth TLS failed");
+      Serial.printf("[eBay] OAuth official host connect failed: %s (%d)\n", sslErr, sslCode);
+    } else {
+      snprintf(eb_last_error, sizeof(eb_last_error), "OAuth connect failed");
+      Serial.println("[eBay] OAuth official host connect failed");
+    }
+    return false;
+  }
+
+  eb_last_api_ip = usedIp;
+  strncpy(eb_api_host, "api.ebay.com", sizeof(eb_api_host) - 1);
+  eb_api_host[sizeof(eb_api_host) - 1] = '\0';
+  Serial.printf("[eBay] OAuth connected to official host via %s\n", usedIp.toString().c_str());
+
+  char creds[350];
+  snprintf(creds, sizeof(creds), "%s:%s", eb_appid, eb_certid);
+  char b64[600];
+  b64Encode(creds, b64, sizeof(b64));
+
+  const char *payload =
+    "grant_type=client_credentials"
+    "&scope=https%3A%2F%2Fapi.ebay.com%2Foauth%2Fapi_scope";
+
+  String req;
+  req.reserve(1024);
+  req += "POST /identity/v1/oauth2/token HTTP/1.1\r\n";
+  req += "Host: api.ebay.com\r\n";
+  req += "User-Agent: CYDEbayTicker/1.0\r\n";
+  req += "Authorization: Basic ";
+  req += b64;
+  req += "\r\n";
+  req += "Content-Type: application/x-www-form-urlencoded\r\n";
+  req += "Content-Length: ";
+  req += strlen(payload);
+  req += "\r\n";
+  req += "Connection: close\r\n\r\n";
+  req += payload;
+
+  if (client.print(req) != (int)req.length()) {
+    snprintf(eb_last_error, sizeof(eb_last_error), "OAuth send failed");
+    client.stop();
+    return false;
+  }
+
+  bool ok = ebReadHttpResponse(client, statusCode, body);
+  client.stop();
+  if (!ok) {
+    snprintf(eb_last_error, sizeof(eb_last_error), "OAuth read failed");
+    return false;
+  }
+
+  return true;
+}
+
+static bool ebFetchBrowseOfficial(const char *url, String &body, int &statusCode) {
+  char uri[384];
+  if (!ebExtractUri(url, uri, sizeof(uri))) {
+    snprintf(eb_last_error, sizeof(eb_last_error), "Browse URL err");
+    return false;
+  }
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  client.setTimeout(8);
+  client.setHandshakeTimeout(8);
+
+  IPAddress usedIp;
+  if (!ebConnectOfficialApiHost(client, usedIp)) {
+    char sslErr[96] = "";
+    int sslCode = client.lastError(sslErr, sizeof(sslErr));
+    if (sslCode != 0) {
+      snprintf(eb_last_error, sizeof(eb_last_error), "Browse TLS failed");
+      Serial.printf("[eBay] Browse official host connect failed: %s (%d)\n", sslErr, sslCode);
+    } else {
+      snprintf(eb_last_error, sizeof(eb_last_error), "Browse connect failed");
+      Serial.println("[eBay] Browse official host connect failed");
+    }
+    return false;
+  }
+
+  eb_last_api_ip = usedIp;
+  strncpy(eb_api_host, "api.ebay.com", sizeof(eb_api_host) - 1);
+  eb_api_host[sizeof(eb_api_host) - 1] = '\0';
+
+  String req;
+  req.reserve(1024);
+  req += "GET ";
+  req += uri;
+  req += " HTTP/1.1\r\n";
+  req += "Host: api.ebay.com\r\n";
+  req += "User-Agent: CYDEbayTicker/1.0\r\n";
+  req += "Authorization: ";
+  req += eb_auth_hdr;
+  req += "\r\n";
+  req += "X-EBAY-C-MARKETPLACE-ID: EBAY_US\r\n";
+  req += "Connection: close\r\n\r\n";
+
+  if (client.print(req) != (int)req.length()) {
+    snprintf(eb_last_error, sizeof(eb_last_error), "Browse send failed");
+    client.stop();
+    return false;
+  }
+
+  bool ok = ebReadHttpResponse(client, statusCode, body);
+  client.stop();
+  if (!ok) {
+    snprintf(eb_last_error, sizeof(eb_last_error), "Browse read failed");
+    return false;
+  }
+
+  return true;
+}
+
+static bool ebDiagnoseApiConnect(const char *prefix) {
+  IPAddress apiIp;
+  if (!ebResolveApiHost(apiIp)) {
+    Serial.printf("[eBay] %s DNS lookup failed for api.ebay.com and apiz.ebay.com\n", prefix);
+    ebLogNetContext(prefix);
+    if (ebApplyFallbackDns(prefix) && ebResolveApiHost(apiIp)) {
+      eb_last_api_ip = apiIp;
+      Serial.printf("[eBay] %s DNS recovered via fallback host %s -> %s\n",
+                    prefix, eb_api_host, apiIp.toString().c_str());
+    } else {
+      snprintf(eb_last_error, sizeof(eb_last_error), "%s DNS failed", prefix);
+      return false;
+    }
+  }
+
+  eb_last_api_ip = apiIp;
+  Serial.printf("[eBay] %s resolved %s -> %s\n",
+                prefix, eb_api_host, apiIp.toString().c_str());
+
+  WiFiClientSecure probe;
+  probe.setInsecure();
+  probe.setTimeout(15);
+  probe.setHandshakeTimeout(15);
+
+  if (!probe.connect(eb_api_host, 443)) {
+    char sslErr[96] = "";
+    int sslCode = probe.lastError(sslErr, sizeof(sslErr));
+    if (sslCode != 0) {
+      snprintf(eb_last_error, sizeof(eb_last_error), "%s TLS failed", prefix);
+      Serial.printf("[eBay] %s TLS probe failed: %s (%d)\n",
+                    prefix, sslErr, sslCode);
+    } else {
+      snprintf(eb_last_error, sizeof(eb_last_error), "%s connect failed", prefix);
+      Serial.printf("[eBay] %s TCP/TLS probe failed with no SSL detail\n", prefix);
+    }
+    ebLogNetContext(prefix);
+    probe.stop();
+    return false;
+  }
+
+  Serial.printf("[eBay] %s TLS probe OK to %s (%s):443\n",
+                prefix, eb_api_host, apiIp.toString().c_str());
+  probe.stop();
+  return true;
+}
 
 // ---------------------------------------------------------------------------
 // Base64 encoder — needed for HTTP Basic auth in OAuth token request
@@ -108,59 +486,63 @@ static bool ebGetToken() {
     return false;
   }
 
-  // Build Basic auth header: base64(appid:certid)
-  char creds[350];
-  snprintf(creds, sizeof(creds), "%s:%s", eb_appid, eb_certid);
-  char b64[600];
-  b64Encode(creds, b64, sizeof(b64));
-  char basicHdr[660];
-  snprintf(basicHdr, sizeof(basicHdr), "Basic %s", b64);
+  for (int attempt = 1; attempt <= 2; attempt++) {
+    int code = 0;
+    String body;
+    if (!ebFetchTokenOfficial(body, code)) {
+      Serial.printf("[eBay] OAuth fetch failed (attempt %d/2): %s\n", attempt, eb_last_error);
+      if (attempt < 2) {
+        delay(750);
+        continue;
+      }
+      identity_error_flags |= EB_ERRFLAG_OAUTH;
+      return false;
+    }
 
-  WiFiClientSecure client;
-  client.setInsecure();
-  HTTPClient http;
-  http.setTimeout(10000);
+    if (code != HTTP_CODE_OK) {
+      ebSetHttpError("OAuth", code);
+      Serial.printf("[eBay] OAuth failure (attempt %d/2): %s\n",
+                    attempt, eb_last_error);
+      if (body.length()) {
+        Serial.printf("[eBay] OAuth body: %.200s\n", body.c_str());
+      }
+      if (attempt < 2 && ebShouldRetryHttpCode(code)) {
+        delay(750);
+        continue;
+      }
+      identity_error_flags |= EB_ERRFLAG_OAUTH;
+      return false;
+    }
 
-  if (!http.begin(client, "https://api.ebay.com/identity/v1/oauth2/token")) return false;
-  http.addHeader("Content-Type",  "application/x-www-form-urlencoded");
-  http.addHeader("Authorization", basicHdr);
+    JsonDocument doc;
+    if (deserializeJson(doc, body)) {
+      snprintf(eb_last_error, sizeof(eb_last_error), "OAuth JSON err");
+      Serial.printf("[eBay] OAuth JSON parse failed. Body: %.240s\n", body.c_str());
+      identity_error_flags |= EB_ERRFLAG_OAUTH;
+      return false;
+    }
 
-  int code = http.POST(
-    "grant_type=client_credentials"
-    "&scope=https%3A%2F%2Fapi.ebay.com%2Foauth%2Fapi_scope");
+    const char *tok = doc["access_token"] | "";
+    int expiresIn   = doc["expires_in"]   | 7200;
 
-  if (code != HTTP_CODE_OK) {
-    snprintf(eb_last_error, sizeof(eb_last_error), "OAuth %d", code);
-    Serial.printf("[eBay] OAuth HTTP %d: %s\n", code, http.getString().substring(0,200).c_str());
-    http.end();
-    return false;
+    if (!tok[0]) {
+      snprintf(eb_last_error, sizeof(eb_last_error), "No token");
+      identity_error_flags |= EB_ERRFLAG_OAUTH;
+      return false;
+    }
+
+    strncpy(eb_token, tok, sizeof(eb_token) - 1);
+    eb_token[sizeof(eb_token) - 1] = '\0';
+    snprintf(eb_auth_hdr, sizeof(eb_auth_hdr), "Bearer %s", eb_token);
+    eb_token_expiry = now + expiresIn;
+
+    Serial.printf("[eBay] Token OK — length=%d, expires in %ds\n",
+                  (int)strlen(eb_token), expiresIn);
+    return true;
   }
 
-  String body = http.getString();
-  http.end();
-
-  JsonDocument doc;
-  if (deserializeJson(doc, body)) {
-    snprintf(eb_last_error, sizeof(eb_last_error), "OAuth JSON err");
-    return false;
-  }
-
-  const char *tok = doc["access_token"] | "";
-  int expiresIn   = doc["expires_in"]   | 7200;
-
-  if (!tok[0]) {
-    snprintf(eb_last_error, sizeof(eb_last_error), "No token");
-    return false;
-  }
-
-  strncpy(eb_token, tok, sizeof(eb_token) - 1);
-  eb_token[sizeof(eb_token) - 1] = '\0';
-  snprintf(eb_auth_hdr, sizeof(eb_auth_hdr), "Bearer %s", eb_token);
-  eb_token_expiry = now + expiresIn;
-
-  Serial.printf("[eBay] Token OK — length=%d, expires in %ds\n",
-                (int)strlen(eb_token), expiresIn);
-  return true;
+  identity_error_flags |= EB_ERRFLAG_OAUTH;
+  return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -231,41 +613,53 @@ static int ebParseItems(JsonArray items) {
 // Browse API GET + JSON parse (shared by seller and keyword fetches)
 // ---------------------------------------------------------------------------
 static int ebBrowseSearch(const char *url) {
-  WiFiClientSecure client;
-  client.setInsecure();
-  HTTPClient http;
-  http.setTimeout(10000);
+  for (int attempt = 1; attempt <= 2; attempt++) {
+    int code = 0;
+    String payload;
+    if (!ebFetchBrowseOfficial(url, payload, code)) {
+      Serial.printf("[eBay] Browse fetch failed (attempt %d/2): %s\n", attempt, eb_last_error);
+      if (attempt < 2) {
+        delay(750);
+        continue;
+      }
+      identity_error_flags |= EB_ERRFLAG_BROWSE;
+      return 0;
+    }
 
-  if (!http.begin(client, url)) return 0;
-  http.addHeader("Authorization",           eb_auth_hdr);
-  http.addHeader("X-EBAY-C-MARKETPLACE-ID", "EBAY_US");
+    if (code != HTTP_CODE_OK) {
+      ebSetHttpError("Browse", code);
+      Serial.printf("[eBay] Browse failure (attempt %d/2)\n  Error: %s\n  URL: %.120s\n",
+                    attempt, eb_last_error, url);
+      if (payload.length()) {
+        Serial.printf("  Body: %.300s\n", payload.c_str());
+      }
+      if (attempt < 2 && ebShouldRetryHttpCode(code)) {
+        delay(750);
+        continue;
+      }
+      identity_error_flags |= EB_ERRFLAG_BROWSE;
+      return 0;
+    }
 
-  int code = http.GET();
-  if (code != HTTP_CODE_OK) {
-    String errBody = http.getString();
-    snprintf(eb_last_error, sizeof(eb_last_error), "HTTP %d", code);
-    Serial.printf("[eBay] Browse HTTP %d\n  URL: %.120s\n  Body: %.300s\n",
-                  code, url, errBody.c_str());
-    http.end();
-    return 0;
+    JsonDocument doc;
+    if (deserializeJson(doc, payload)) {
+      snprintf(eb_last_error, sizeof(eb_last_error), "JSON error");
+      Serial.printf("[eBay] Browse JSON parse failed. Body: %.240s\n", payload.c_str());
+      identity_error_flags |= EB_ERRFLAG_BROWSE;
+      return 0;
+    }
+
+    JsonArray items = doc["itemSummaries"].as<JsonArray>();
+    if (items.isNull()) {
+      Serial.println("[eBay] No itemSummaries in response");
+      return 0;
+    }
+
+    return ebParseItems(items);
   }
 
-  String payload = http.getString();
-  http.end();
-
-  JsonDocument doc;
-  if (deserializeJson(doc, payload)) {
-    snprintf(eb_last_error, sizeof(eb_last_error), "JSON error");
-    return 0;
-  }
-
-  JsonArray items = doc["itemSummaries"].as<JsonArray>();
-  if (items.isNull()) {
-    Serial.println("[eBay] No itemSummaries in response");
-    return 0;
-  }
-
-  return ebParseItems(items);
+  identity_error_flags |= EB_ERRFLAG_BROWSE;
+  return 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -280,10 +674,10 @@ static int ebFetchSeller(const char *sellerId) {
   if (eb_cat_id[0]) {
     char url[512];
     snprintf(url, sizeof(url),
-      "https://api.ebay.com/buy/browse/v1/item_summary/search"
+      "https://%s/buy/browse/v1/item_summary/search"
       "?category_ids=%s&filter=sellers%%3A%%7B%s%%7D%%2CbuyingOptions%%3A%%7BAUCTION%%7D"
       "&sort=endingSoonest&limit=%d",
-      eb_cat_id, sellerId, EB_PER_SELLER);
+      eb_api_host, eb_cat_id, sellerId, EB_PER_SELLER);
     Serial.printf("[eBay] Seller: %s  cat: %s\n", sellerId, eb_cat_id);
     int added = ebBrowseSearch(url);
     Serial.printf("[eBay] Added %d items from seller %s\n", added, sellerId);
@@ -311,10 +705,10 @@ static int ebFetchSeller(const char *sellerId) {
 
       char url[512];
       snprintf(url, sizeof(url),
-        "https://api.ebay.com/buy/browse/v1/item_summary/search"
+        "https://%s/buy/browse/v1/item_summary/search"
         "?q=%s&filter=sellers%%3A%%7B%s%%7D%%2CbuyingOptions%%3A%%7BAUCTION%%7D"
         "&sort=endingSoonest&limit=%d",
-        encTok, sellerId, EB_PER_SELLER);
+        eb_api_host, encTok, sellerId, EB_PER_SELLER);
       Serial.printf("[eBay] Seller: %s  kw: %s\n", sellerId, encTok);
       totalAdded += ebBrowseSearch(url);
     }
@@ -338,10 +732,10 @@ static int ebFetchKeyword(const char *keyword) {
 
   char url[512];
   snprintf(url, sizeof(url),
-    "https://api.ebay.com/buy/browse/v1/item_summary/search"
+    "https://%s/buy/browse/v1/item_summary/search"
     "?q=%s&filter=buyingOptions%%3A%%7BAUCTION%%7D"
     "&sort=endingSoonest&limit=%d",
-    encoded, EB_MAX_ITEMS);
+    eb_api_host, encoded, EB_MAX_ITEMS);
 
   Serial.printf("[eBay] Fetching keyword: %s\n", keyword);
   int added = ebBrowseSearch(url);
@@ -370,6 +764,7 @@ static void ebSortItems() {
 static bool ebFetchAll() {
   eb_item_count    = 0;
   eb_last_error[0] = '\0';
+  identity_error_flags = 0;
 
   bool hasSeller = (eb_seller1[0] || eb_seller2[0] || eb_seller3[0]);
 
@@ -390,6 +785,7 @@ static bool ebFetchAll() {
   if (eb_item_count > 0) {
     ebSortItems();
     eb_last_fetch = time(nullptr);
+    identity_last_fetch = (unsigned long)eb_last_fetch;
     for (int i = 0; i < eb_item_count; i++)
       ebFormatTimeLeft(eb_items[i].endEpoch, eb_items[i].timeLeft,
                        sizeof(eb_items[i].timeLeft));
