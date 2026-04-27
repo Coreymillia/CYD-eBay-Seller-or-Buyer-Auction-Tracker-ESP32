@@ -4,7 +4,7 @@
 // Updates every 5 minutes. Short press BOOT cycles pages; 3s hold = setup.
 
 #define DEVICE_NAME      "CYDEbayTicker"
-#define FIRMWARE_VERSION "1.0.1"
+#define FIRMWARE_VERSION "1.0.2"
 #include "CYDIdentity.h"
 
 #include <Arduino.h>
@@ -192,11 +192,13 @@ void drawHeader() {
     gfx->setTextColor(0x07FF);  // cyan
     gfx->print(cntBuf);
 
-    // Updated time in grey right after
-    time_t now = time(nullptr);
-    struct tm *t = gmtime(&now);
+    // Last successful refresh time in grey right after
+    time_t stamp = eb_last_fetch ? eb_last_fetch : time(nullptr);
+    struct tm *t = gmtime(&stamp);
     char timeBuf[24];
-    snprintf(timeBuf, sizeof(timeBuf), "  %02d:%02d UTC", t->tm_hour, t->tm_min);
+    snprintf(timeBuf, sizeof(timeBuf),
+             eb_refresh_stale ? "  stale %02d:%02d" : "  %02d:%02d UTC",
+             t->tm_hour, t->tm_min);
     gfx->setTextColor(COLOR_DIM);
     gfx->print(timeBuf);
 

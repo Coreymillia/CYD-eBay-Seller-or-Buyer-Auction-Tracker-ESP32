@@ -47,6 +47,8 @@ When any auction enters its final **1 hour**, the device automatically switches 
 
 It switches back to normal pace once all auctions are back above 1 hour or ended.
 
+If eBay temporarily returns a gateway timeout or other transient API error, the device now keeps showing the **last successful auction set** and marks the header timestamp as **stale** instead of blanking the screen with a fetch failure.
+
 ---
 
 ## Hardware

@@ -27,11 +27,13 @@ struct EbayItem {
 };
 
 static EbayItem eb_items[EB_MAX_ITEMS];
+static EbayItem eb_items_backup[EB_MAX_ITEMS];
 static int      eb_item_count  = 0;
 static char     eb_last_error[64] = "";
 static time_t   eb_last_fetch  = 0;
 static IPAddress eb_last_api_ip;
 static char     eb_api_host[20] = "api.ebay.com";
+static bool     eb_refresh_stale = false;
 
 // OAuth token cache (Browse API requires Bearer token)
 // eBay tokens can exceed 1000 chars; use generous buffers to avoid truncation
@@ -43,12 +45,21 @@ static void b64Encode(const char *src, char *dst, size_t dstLen);
 
 #define EB_ERRFLAG_OAUTH  0x00000001u
 #define EB_ERRFLAG_BROWSE 0x00000002u
+#define EB_HTTP_TIMEOUT_S 15
+#define EB_HTTP_IDLE_MS   15000UL
+#define EB_HTTP_MAX_ATTEMPTS 4
 
 // ---------------------------------------------------------------------------
 // Error helpers
 // ---------------------------------------------------------------------------
 static bool ebShouldRetryHttpCode(int code) {
   return (code < 0 || code >= 500);
+}
+
+static unsigned long ebRetryDelayMs(int attempt, int code) {
+  if (code == 504) return 2500UL * attempt;
+  if (code == 502 || code == 503) return 1500UL * attempt;
+  return 750UL * attempt;
 }
 
 static const char *ebFallbackApiHost(const char *host) {
@@ -139,9 +150,46 @@ static bool ebConnectOfficialApiHost(WiFiClientSecure &client, IPAddress &usedIp
   return false;
 }
 
+static bool ebWaitForData(WiFiClientSecure &client, unsigned long timeoutMs) {
+  unsigned long start = millis();
+  while (!client.available()) {
+    if (!client.connected()) return false;
+    if (millis() - start >= timeoutMs) return false;
+    delay(10);
+  }
+  return true;
+}
+
+static bool ebReadLine(WiFiClientSecure &client, String &line, unsigned long timeoutMs) {
+  line = "";
+  unsigned long lastDataMs = millis();
+  bool sawData = false;
+
+  while (true) {
+    while (client.available()) {
+      char c = (char)client.read();
+      sawData = true;
+      lastDataMs = millis();
+
+      if (c == '\r') continue;
+      if (c == '\n') return true;
+      line += c;
+    }
+
+    if (sawData && !client.connected()) return true;
+    if (!sawData && !client.connected()) return false;
+    if (millis() - lastDataMs >= timeoutMs) return false;
+    delay(10);
+  }
+}
+
 static bool ebReadHttpResponse(WiFiClientSecure &client, int &statusCode, String &body) {
-  String statusLine = client.readStringUntil('\n');
-  statusLine.trim();
+  String statusLine;
+  do {
+    if (!ebReadLine(client, statusLine, EB_HTTP_IDLE_MS)) return false;
+    statusLine.trim();
+  } while (statusLine.length() == 0);
+
   if (!statusLine.startsWith("HTTP/1.")) {
     return false;
   }
@@ -153,8 +201,8 @@ static bool ebReadHttpResponse(WiFiClientSecure &client, int &statusCode, String
   int contentLength = -1;
   bool chunked = false;
   while (client.connected() || client.available()) {
-    String line = client.readStringUntil('\n');
-    String trimmed = line;
+    String trimmed;
+    if (!ebReadLine(client, trimmed, EB_HTTP_IDLE_MS)) return false;
     trimmed.trim();
     if (trimmed.length() == 0) break;
 
@@ -171,7 +219,8 @@ static bool ebReadHttpResponse(WiFiClientSecure &client, int &statusCode, String
   body = "";
   if (chunked) {
     while (true) {
-      String sizeLine = client.readStringUntil('\n');
+      String sizeLine;
+      if (!ebReadLine(client, sizeLine, EB_HTTP_IDLE_MS)) return false;
       sizeLine.trim();
       if (sizeLine.length() == 0) continue;
 
@@ -190,11 +239,7 @@ static bool ebReadHttpResponse(WiFiClientSecure &client, int &statusCode, String
 
       unsigned long lastDataMs = millis();
       while (chunkSize > 0) {
-        if (!client.available()) {
-          if (millis() - lastDataMs >= 15000) return false;
-          delay(10);
-          continue;
-        }
+        if (!client.available() && !ebWaitForData(client, EB_HTTP_IDLE_MS)) return false;
         char c = (char)client.read();
         body += c;
         chunkSize--;
@@ -202,29 +247,22 @@ static bool ebReadHttpResponse(WiFiClientSecure &client, int &statusCode, String
       }
 
       // Consume CRLF after each chunk.
-      unsigned long crlfStart = millis();
-      while (client.available() < 2) {
-        if (millis() - crlfStart >= 15000) return false;
-        delay(10);
-      }
+      if (!ebWaitForData(client, EB_HTTP_IDLE_MS)) return false;
       client.read();
+      if (!ebWaitForData(client, EB_HTTP_IDLE_MS)) return false;
       client.read();
     }
   } else if (contentLength >= 0) {
     unsigned long lastDataMs = millis();
     while ((int)body.length() < contentLength) {
-      if (!client.available()) {
-        if (millis() - lastDataMs >= 15000) return false;
-        delay(10);
-        continue;
-      }
+      if (!client.available() && !ebWaitForData(client, EB_HTTP_IDLE_MS)) return false;
       char c = (char)client.read();
       body += c;
       lastDataMs = millis();
     }
   } else {
     unsigned long lastDataMs = millis();
-    while ((client.connected() || client.available()) && millis() - lastDataMs < 15000) {
+    while ((client.connected() || client.available()) && millis() - lastDataMs < EB_HTTP_IDLE_MS) {
       while (client.available()) {
         body += (char)client.read();
         lastDataMs = millis();
@@ -247,8 +285,8 @@ static bool ebExtractUri(const char *url, char *uri, size_t uriLen) {
 static bool ebFetchTokenOfficial(String &body, int &statusCode) {
   WiFiClientSecure client;
   client.setInsecure();
-  client.setTimeout(8);
-  client.setHandshakeTimeout(8);
+  client.setTimeout(EB_HTTP_TIMEOUT_S);
+  client.setHandshakeTimeout(EB_HTTP_TIMEOUT_S);
 
   IPAddress usedIp;
   if (!ebConnectOfficialApiHost(client, usedIp)) {
@@ -286,6 +324,7 @@ static bool ebFetchTokenOfficial(String &body, int &statusCode) {
   req += "Authorization: Basic ";
   req += b64;
   req += "\r\n";
+  req += "Accept-Encoding: identity\r\n";
   req += "Content-Type: application/x-www-form-urlencoded\r\n";
   req += "Content-Length: ";
   req += strlen(payload);
@@ -318,8 +357,8 @@ static bool ebFetchBrowseOfficial(const char *url, String &body, int &statusCode
 
   WiFiClientSecure client;
   client.setInsecure();
-  client.setTimeout(8);
-  client.setHandshakeTimeout(8);
+  client.setTimeout(EB_HTTP_TIMEOUT_S);
+  client.setHandshakeTimeout(EB_HTTP_TIMEOUT_S);
 
   IPAddress usedIp;
   if (!ebConnectOfficialApiHost(client, usedIp)) {
@@ -350,6 +389,7 @@ static bool ebFetchBrowseOfficial(const char *url, String &body, int &statusCode
   req += eb_auth_hdr;
   req += "\r\n";
   req += "X-EBAY-C-MARKETPLACE-ID: EBAY_US\r\n";
+  req += "Accept-Encoding: identity\r\n";
   req += "Connection: close\r\n\r\n";
 
   if (client.print(req) != (int)req.length()) {
@@ -486,13 +526,14 @@ static bool ebGetToken() {
     return false;
   }
 
-  for (int attempt = 1; attempt <= 2; attempt++) {
+  for (int attempt = 1; attempt <= EB_HTTP_MAX_ATTEMPTS; attempt++) {
     int code = 0;
     String body;
     if (!ebFetchTokenOfficial(body, code)) {
-      Serial.printf("[eBay] OAuth fetch failed (attempt %d/2): %s\n", attempt, eb_last_error);
-      if (attempt < 2) {
-        delay(750);
+      Serial.printf("[eBay] OAuth fetch failed (attempt %d/%d): %s\n",
+                    attempt, EB_HTTP_MAX_ATTEMPTS, eb_last_error);
+      if (attempt < EB_HTTP_MAX_ATTEMPTS) {
+        delay(ebRetryDelayMs(attempt, -1));
         continue;
       }
       identity_error_flags |= EB_ERRFLAG_OAUTH;
@@ -501,13 +542,13 @@ static bool ebGetToken() {
 
     if (code != HTTP_CODE_OK) {
       ebSetHttpError("OAuth", code);
-      Serial.printf("[eBay] OAuth failure (attempt %d/2): %s\n",
-                    attempt, eb_last_error);
+      Serial.printf("[eBay] OAuth failure (attempt %d/%d): %s\n",
+                    attempt, EB_HTTP_MAX_ATTEMPTS, eb_last_error);
       if (body.length()) {
         Serial.printf("[eBay] OAuth body: %.200s\n", body.c_str());
       }
-      if (attempt < 2 && ebShouldRetryHttpCode(code)) {
-        delay(750);
+      if (attempt < EB_HTTP_MAX_ATTEMPTS && ebShouldRetryHttpCode(code)) {
+        delay(ebRetryDelayMs(attempt, code));
         continue;
       }
       identity_error_flags |= EB_ERRFLAG_OAUTH;
@@ -613,13 +654,14 @@ static int ebParseItems(JsonArray items) {
 // Browse API GET + JSON parse (shared by seller and keyword fetches)
 // ---------------------------------------------------------------------------
 static int ebBrowseSearch(const char *url) {
-  for (int attempt = 1; attempt <= 2; attempt++) {
+  for (int attempt = 1; attempt <= EB_HTTP_MAX_ATTEMPTS; attempt++) {
     int code = 0;
     String payload;
     if (!ebFetchBrowseOfficial(url, payload, code)) {
-      Serial.printf("[eBay] Browse fetch failed (attempt %d/2): %s\n", attempt, eb_last_error);
-      if (attempt < 2) {
-        delay(750);
+      Serial.printf("[eBay] Browse fetch failed (attempt %d/%d): %s\n",
+                    attempt, EB_HTTP_MAX_ATTEMPTS, eb_last_error);
+      if (attempt < EB_HTTP_MAX_ATTEMPTS) {
+        delay(ebRetryDelayMs(attempt, -1));
         continue;
       }
       identity_error_flags |= EB_ERRFLAG_BROWSE;
@@ -628,13 +670,13 @@ static int ebBrowseSearch(const char *url) {
 
     if (code != HTTP_CODE_OK) {
       ebSetHttpError("Browse", code);
-      Serial.printf("[eBay] Browse failure (attempt %d/2)\n  Error: %s\n  URL: %.120s\n",
-                    attempt, eb_last_error, url);
+      Serial.printf("[eBay] Browse failure (attempt %d/%d)\n  Error: %s\n  URL: %.120s\n",
+                    attempt, EB_HTTP_MAX_ATTEMPTS, eb_last_error, url);
       if (payload.length()) {
         Serial.printf("  Body: %.300s\n", payload.c_str());
       }
-      if (attempt < 2 && ebShouldRetryHttpCode(code)) {
-        delay(750);
+      if (attempt < EB_HTTP_MAX_ATTEMPTS && ebShouldRetryHttpCode(code)) {
+        delay(ebRetryDelayMs(attempt, code));
         continue;
       }
       identity_error_flags |= EB_ERRFLAG_BROWSE;
@@ -762,9 +804,18 @@ static void ebSortItems() {
 // Main fetch: all configured sellers (or keyword), merge + sort
 // ---------------------------------------------------------------------------
 static bool ebFetchAll() {
+  int prev_item_count = eb_item_count;
+  time_t prev_last_fetch = eb_last_fetch;
+  unsigned long prev_identity_last_fetch = identity_last_fetch;
+  bool had_cached_items = (prev_item_count > 0);
+  if (had_cached_items) {
+    memcpy(eb_items_backup, eb_items, sizeof(eb_items));
+  }
+
   eb_item_count    = 0;
   eb_last_error[0] = '\0';
   identity_error_flags = 0;
+  eb_refresh_stale = false;
 
   bool hasSeller = (eb_seller1[0] || eb_seller2[0] || eb_seller3[0]);
 
@@ -789,6 +840,18 @@ static bool ebFetchAll() {
     for (int i = 0; i < eb_item_count; i++)
       ebFormatTimeLeft(eb_items[i].endEpoch, eb_items[i].timeLeft,
                        sizeof(eb_items[i].timeLeft));
+  }
+
+  if (identity_error_flags != 0 && had_cached_items) {
+    memcpy(eb_items, eb_items_backup, sizeof(eb_items));
+    eb_item_count = prev_item_count;
+    eb_last_fetch = prev_last_fetch;
+    identity_last_fetch = prev_identity_last_fetch;
+    eb_refresh_stale = true;
+    Serial.printf("[eBay] Refresh failed (%s) - showing %d cached items from last good fetch\n",
+                  eb_last_error[0] ? eb_last_error : "unknown error",
+                  eb_item_count);
+    return true;
   }
 
   Serial.printf("[eBay] Total items: %d\n", eb_item_count);
